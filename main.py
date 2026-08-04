@@ -777,3 +777,156 @@ async def proyek_rekomendasi(input: ProyekInput):
     except Exception as e:
         error_traceback = traceback.format_exc()
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}\n\nTraceback:\n{error_traceback}")
+
+
+class GapAnalysisInput(BaseModel):
+    user_id: int
+    target_role: str
+    language: str = "id"
+
+
+@app.post("/learning_path", dependencies=[Security(get_api_key)])
+async def learning_path(input: GapAnalysisInput):
+    try:
+        conn = await asyncpg.connect(SUPABASE_DB_URL)
+        try:
+            # 1. Fetch user's current skills
+            user_row = await conn.fetchrow(
+                "SELECT nama_lengkap, skill_gabungan, aktivitas FROM alumni_db WHERE id = $1", 
+                input.user_id
+            )
+            if not user_row:
+                raise HTTPException(status_code=404, detail="Profil talenta tidak ditemukan.")
+            
+            user_name = user_row["nama_lengkap"]
+            user_skills = user_row["skill_gabungan"] or ""
+            user_activity = user_row["aktivitas"] or ""
+            
+            # 2. Fetch jobs from jobs table matching the target_role
+            jobs = await conn.fetch(
+                """
+                SELECT job_title, company, requirements, description 
+                FROM jobs 
+                WHERE (job_title ILIKE $1 OR category ILIKE $1) AND is_active = true 
+                ORDER BY last_checked DESC LIMIT 8
+                """,
+                f"%{input.target_role}%"
+            )
+            
+            # Fallback 1
+            if not jobs:
+                first_word = input.target_role.split()[0] if input.target_role.strip() else ""
+                if first_word:
+                    jobs = await conn.fetch(
+                        """
+                        SELECT job_title, company, requirements, description 
+                        FROM jobs 
+                        WHERE (job_title ILIKE $1 OR category ILIKE $1) AND is_active = true 
+                        ORDER BY last_checked DESC LIMIT 8
+                        """,
+                        f"%{first_word}%"
+                    )
+            
+            # Fallback 2
+            if not jobs:
+                jobs = await conn.fetch(
+                    """
+                    SELECT job_title, company, requirements, description 
+                    FROM jobs 
+                    WHERE is_active = true 
+                    ORDER BY last_checked DESC LIMIT 6
+                    """
+                )
+                
+            # 3. Format jobs context
+            jobs_context_list = []
+            for job in jobs:
+                title = job["job_title"]
+                company = job["company"]
+                reqs = ", ".join(job["requirements"] or []) or job["description"][:300]
+                jobs_context_list.append(f"- {title} di {company}. Persyaratan: {reqs}")
+            
+            jobs_context = "\n".join(jobs_context_list)
+            
+            # 4. Build prompt
+            prompt = (
+                f"Analisis Kebutuhan Karir untuk: {user_name}\n"
+                f"Target Pekerjaan / Peran: {input.target_role}\n"
+                f"Keahlian Pengguna Saat Ini: {user_skills}\n"
+                f"Aktivitas Saat Ini: {user_activity}\n\n"
+                f"Data Persyaratan Industri Aktual (LinkedIn & Kalibrr):\n"
+                f"{jobs_context}\n\n"
+                f"TUGAS ANDA:\n"
+                f"Bandingkan keahlian pengguna dengan kebutuhan nyata industri di atas. Hasilkan respons JSON yang valid berisi:\n"
+                f"1. `gap_analysis`: Daftar keahlian penting yang belum dimiliki pengguna tapi sangat dibutuhkan industri untuk peran '{input.target_role}' (maksimal 4 item). Sertakan penjelasan singkat ('description') mengapa ini penting.\n"
+                f"2. `learning_path`: Rencana belajar bertahap (minimal 3 langkah berurutan) untuk menguasai keahlian yang kurang tersebut. Setiap langkah harus memiliki 'step' (integer), 'topic' (nama topik), 'courses_certs' (rekomendasi kursus/sertifikasi spesifik dalam array string, misal: 'Google IT Support Certification', 'React - The Complete Guide on Udemy'), dan 'action_plan' (langkah belajarnya).\n"
+                f"3. `checklist`: Daftar aksi konkret (minimal 5 item string) persiapan kerja yang sangat spesifik (misal: 'Perbarui resume dengan skill React', 'Buat portofolio website statis', 'Selesaikan sertifikasi AWS Cloud Practitioner').\n\n"
+                f"Gunakan bahasa Indonesia yang profesional, jelas, dan memotivasi."
+            )
+            
+            # 5. Call Gemini API with structured JSON output schema
+            headers_api = {"Content-Type": "application/json"}
+            gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "responseMimeType": "application/json",
+                    "responseSchema": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "gap_analysis": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "skill": {"type": "STRING"},
+                                        "description": {"type": "STRING"}
+                                    },
+                                    "required": ["skill", "description"]
+                                }
+                            },
+                            "learning_path": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "step": {"type": "INTEGER"},
+                                        "topic": {"type": "STRING"},
+                                        "courses_certs": {
+                                            "type": "ARRAY",
+                                            "items": {"type": "STRING"}
+                                        },
+                                        "action_plan": {"type": "STRING"}
+                                    },
+                                    "required": ["step", "topic", "courses_certs", "action_plan"]
+                                }
+                            },
+                            "checklist": {
+                                "type": "ARRAY",
+                                "items": {"type": "STRING"}
+                            }
+                        },
+                        "required": ["gap_analysis", "learning_path", "checklist"]
+                    }
+                }
+            }
+            
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                res = await client.post(gemini_api_url, headers=headers_api, json=body)
+                res.raise_for_status()
+                content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                
+                import json
+                parsed_json = json.loads(content)
+                return parsed_json
+                
+        finally:
+            await conn.close()
+            
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}\n\nTraceback:\n{error_traceback}")
