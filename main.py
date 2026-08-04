@@ -847,35 +847,75 @@ async def learning_path(input: LearningPathInput):
         profile_summary = sanitize_ai_input(f"{data.get('skills', '')}. {data.get('gabungan_data', '')}", max_length=1800)
         education_summary = sanitize_ai_input("; ".join(data.get("education_summaries", [])), max_length=600)
 
-        # Ambil data lowongan kerja aktif yang relevan dari pangkalan data lokal
+        # Local RAG / Semantic Matchmaking against ALL active jobs in database
         jobs_context = ""
         conn = await asyncpg.connect(SUPABASE_DB_URL, statement_cache_size=0)
         try:
-            # Query active jobs matching target_role keyword
-            jobs_rows = await conn.fetch("""
+            # Fetch all active jobs from the database for ranking
+            all_active_jobs = await conn.fetch("""
                 SELECT job_title, company, description, job_desk, requirements, category
                 FROM jobs
-                WHERE is_active = true 
-                  AND (job_title ILIKE $1 OR description ILIKE $1 OR category ILIKE $1)
-                ORDER BY id DESC
-                LIMIT 3
-            """, f"%{target_role}%")
+                WHERE is_active = true
+            """)
             
-            if jobs_rows:
-                jobs_list = []
-                for job in jobs_rows:
-                    job_desk_str = ", ".join(job['job_desk']) if job['job_desk'] else "Tidak dispesifikasikan"
-                    reqs_str = ", ".join(job['requirements']) if job['requirements'] else "Tidak dispesifikasikan"
-                    jobs_list.append(
-                        f"- Lowongan: {job['job_title']} di {job['company']}\n"
-                        f"  Kategori: {job['category']}\n"
-                        f"  Deskripsi Singkat: {job['description'][:200]}...\n"
-                        f"  Tugas/Job Desk: {job_desk_str[:300]}\n"
-                        f"  Persyaratan Utama: {reqs_str[:300]}"
+            if all_active_jobs:
+                role_tokens = tokenize_text(target_role)
+                matched_jobs = []
+                
+                for job in all_active_jobs:
+                    # Combine texts for semantic match score
+                    job_text = f"{job['job_title']} {job['category']} {job['description']}"
+                    if job['requirements']:
+                        job_text += " " + " ".join(job['requirements'])
+                    if job['job_desk']:
+                        job_text += " " + " ".join(job['job_desk'])
+                        
+                    score = compute_weighted_match_score(role_tokens, job_text)
+                    
+                    # Boost score if target role is in job title
+                    if target_role.lower() in job['job_title'].lower():
+                        score += 5.0
+                        
+                    if score > 0:
+                        matched_jobs.append({
+                            "job": job,
+                            "score": score
+                        })
+                
+                # Sort by matching score descending
+                matched_jobs.sort(key=lambda x: x['score'], reverse=True)
+                
+                if matched_jobs:
+                    # Get top 5 matched jobs as representative examples
+                    top_matches = matched_jobs[:5]
+                    
+                    # Aggregate requirements and job desk responsibilities from all matched jobs (baseline)
+                    all_requirements = []
+                    all_tasks = []
+                    for mj in matched_jobs:
+                        j = mj['job']
+                        if j['requirements']:
+                            all_requirements.extend([r.strip() for r in j['requirements'] if r.strip()])
+                        if j['job_desk']:
+                            all_tasks.extend([t.strip() for t in j['job_desk'] if t.strip()])
+                    
+                    # Deduplicate and limit key requirements and tasks
+                    unique_reqs = list(dict.fromkeys(all_requirements))[:15]
+                    unique_tasks = list(dict.fromkeys(all_tasks))[:15]
+                    
+                    jobs_list_str = []
+                    for mj in top_matches:
+                        j = mj['job']
+                        jobs_list_str.append(f"- {j['job_title']} di {j['company']} (Skor Match: {mj['score']})")
+                        
+                    jobs_context = (
+                        f"Ditemukan {len(matched_jobs)} lowongan kerja aktif yang cocok di database lokal.\n"
+                        f"5 Contoh Lowongan Teratas:\n" + "\n".join(jobs_list_str) + "\n\n"
+                        f"Persyaratan Utama Teragregasi (Baseline Kebutuhan dari seluruh lowongan cocok):\n" + "\n".join([f"- {req}" for req in unique_reqs]) + "\n\n"
+                        f"Tanggung Jawab Teragregasi (Baseline Tugas dari seluruh lowongan cocok):\n" + "\n".join([f"- {task}" for task in unique_tasks])
                     )
-                jobs_context = "\n\n".join(jobs_list)
         except Exception as e:
-            print(f"Error fetching jobs context for learning path: {e}")
+            print(f"Error executing jobs RAG: {e}")
         finally:
             await conn.close()
 
