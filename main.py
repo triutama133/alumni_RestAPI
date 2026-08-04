@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from typing import Optional
+import json
+import logging
 import os
 import re
 import httpx
@@ -16,6 +18,9 @@ load_dotenv()
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
 # Inisialisasi aplikasi FastAPI
@@ -56,6 +61,19 @@ class ProyekInput(BaseModel):
     ide_proyek: str
     cohort_id: Optional[int] = None
     language: str = "id"
+
+class LearningPathInput(BaseModel):
+    user_id: int
+    target_role: str
+    language: str = "id"
+
+def sanitize_ai_input(text: str, max_length: int = 500) -> str:
+    """Membersihkan input pengguna sebelum disertakan ke prompt LLM."""
+    if not text:
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+    text = text.replace("SYSTEM:", "").replace("IGNORE PREVIOUS", "").replace("---", "")
+    return text[:max_length].strip()
 
 def normalize_aktivitas_values(value):
     if value is None:
@@ -98,6 +116,90 @@ def compute_weighted_match_score(source_tokens, target_text: str, priority_keywo
         else:
             score += 1.0
     return score
+
+async def call_gemini(prompt: str, temperature: float = 0.7) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY belum dikonfigurasi.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 2500},
+    }
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        res = await client.post(url, headers={"Content-Type": "application/json"}, json=body)
+        res.raise_for_status()
+        return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+async def call_deepseek(prompt: str, temperature: float = 0.7) -> str:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY belum dikonfigurasi.")
+    url = "https://api.deepseek.com/chat/completions"
+    body = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": 2000,
+    }
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        res = await client.post(
+            url,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json=body,
+        )
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"].strip()
+
+
+async def call_llm_service(prompt: str, temperature: float = 0.7) -> str:
+    """Dispatcher LLM dengan fallback otomatis ke provider cadangan."""
+    providers = {
+        "gemini": call_gemini,
+        "deepseek": call_deepseek,
+    }
+
+    primary = LLM_PROVIDER if LLM_PROVIDER in providers else "gemini"
+    secondary = "deepseek" if primary == "gemini" else "gemini"
+
+    try:
+        logging.info("[LLM] Calling primary provider: %s", primary)
+        return await providers[primary](prompt, temperature)
+    except Exception as primary_err:
+        logging.warning("[LLM] Primary provider %s failed: %s. Falling back to %s", primary, primary_err, secondary)
+        try:
+            return await providers[secondary](prompt, temperature)
+        except Exception as secondary_err:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Semua provider LLM gagal. "
+                    f"[{primary}: {primary_err}] [{secondary}: {secondary_err}]"
+                ),
+            )
+
+
+def parse_learning_path_json(raw_text: str) -> dict:
+    """Ekstrak objek JSON dari respons model agar frontend selalu menerima struktur stabil."""
+    text = (raw_text or "").strip()
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        raise ValueError("Respons AI tidak berisi JSON valid.")
+
+    payload = json.loads(match.group(0))
+    gap_analysis = payload.get("gap_analysis")
+    learning_path = payload.get("learning_path")
+    checklist = payload.get("checklist")
+
+    if not isinstance(gap_analysis, list) or not isinstance(learning_path, list) or not isinstance(checklist, list):
+        raise ValueError("Struktur JSON AI tidak sesuai format yang dibutuhkan.")
+
+    return {
+        "gap_analysis": gap_analysis,
+        "learning_path": learning_path,
+        "checklist": checklist,
+    }
 
 # --- FUNGSI LOGIKA INTI ---
 
@@ -670,19 +772,8 @@ async def rekomendasi(input: RekomendasiInput):
         data = await ambil_profil_alumni(user_id=input.user_id, nama_lengkap=input.nama_lengkap, cohort_id=input.cohort_id)
         prompt = build_prompt(data, input.language, source="profile")
 
-        headers = {"Content-Type": "application/json"}
-        gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2500}
-        }
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            res = await client.post(gemini_api_url, headers=headers, json=body)
-            res.raise_for_status()
-            content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"rekomendasi": content.strip()}
+        content = await call_llm_service(prompt)
+        return {"rekomendasi": content.strip()}
 
     except HTTPException as e:
         raise e
@@ -698,19 +789,8 @@ async def wawasan(input: WawasanInput):
         data = await ambil_profil_alumni(user_id=input.user_id, nama_lengkap=input.nama_lengkap, cohort_id=input.cohort_id)
         prompt = build_prompt(data, input.language, source="home")
 
-        headers = {"Content-Type": "application/json"}
-        gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2500}
-        }
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            res = await client.post(gemini_api_url, headers=headers, json=body)
-            res.raise_for_status()
-            content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"wawasan": content.strip()}
+        content = await call_llm_service(prompt)
+        return {"wawasan": content.strip()}
 
     except HTTPException as e:
         raise e
@@ -727,19 +807,8 @@ async def karir(input: RekomendasiInput):
         data = await ambil_profil_alumni(user_id=input.user_id, nama_lengkap=input.nama_lengkap, cohort_id=input.cohort_id)
         prompt = build_prompt(data, input.language, source="karir")
 
-        headers = {"Content-Type": "application/json"}
-        gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2500}
-        }
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            res = await client.post(gemini_api_url, headers=headers, json=body)
-            res.raise_for_status()
-            content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"karir": content.strip()}
+        content = await call_llm_service(prompt)
+        return {"karir": content.strip()}
 
     except HTTPException as e:
         raise e
@@ -758,22 +827,55 @@ async def proyek_rekomendasi(input: ProyekInput):
         recommended_alumni_data = await cari_alumni_untuk_proyek(project_text, cohort_id=input.cohort_id)
         prompt = build_proyek_prompt(input, recommended_alumni_data, input.language)
 
-        headers = {"Content-Type": "application/json"}
-        gemini_api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2500}
-        }
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            res = await client.post(gemini_api_url, headers=headers, json=body)
-            res.raise_for_status()
-            content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return {"rekomendasi_proyek": content.strip()}
+        content = await call_llm_service(prompt)
+        return {"rekomendasi_proyek": content.strip()}
 
     except HTTPException as e:
         raise e
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}\n\nTraceback:\n{error_traceback}")
+
+
+@app.post("/learning_path", dependencies=[Security(get_api_key)])
+async def learning_path(input: LearningPathInput):
+    try:
+        target_role = sanitize_ai_input(input.target_role)
+        if not target_role:
+            raise HTTPException(status_code=400, detail="target_role wajib diisi.")
+
+        data = await ambil_profil_alumni(user_id=input.user_id)
+        profile_summary = sanitize_ai_input(f"{data.get('skills', '')}. {data.get('gabungan_data', '')}", max_length=1800)
+        education_summary = sanitize_ai_input("; ".join(data.get("education_summaries", [])), max_length=600)
+
+        prompt = (
+            "Anda adalah mentor karir AI untuk persiapan kerja. "
+            "Buat analisis gap skill dan learning path yang spesifik, realistis, dan bisa dieksekusi.\n\n"
+            f"Target role: {target_role}\n"
+            f"Aktivitas pengguna saat ini: {data.get('aktivitas_primary', 'tidak diketahui')}\n"
+            f"Ringkasan skill dan profil: {profile_summary}\n"
+            f"Riwayat pendidikan: {education_summary or 'Tidak ada data'}\n\n"
+            "Kembalikan HANYA JSON valid, tanpa teks lain, dengan skema berikut:\n"
+            "{\n"
+            "  \"gap_analysis\": [\n"
+            "    {\"skill\": \"...\", \"description\": \"...\"}\n"
+            "  ],\n"
+            "  \"learning_path\": [\n"
+            "    {\"step\": 1, \"topic\": \"...\", \"courses_certs\": [\"...\"], \"action_plan\": \"...\"}\n"
+            "  ],\n"
+            "  \"checklist\": [\"...\"]\n"
+            "}\n"
+            "Aturan: hasil dalam Bahasa Indonesia, maksimal 5 item gap_analysis, 6 step learning_path, 12 checklist item."
+        )
+
+        raw_response = await call_llm_service(prompt, temperature=0.55)
+        parsed = parse_learning_path_json(raw_response)
+        return parsed
+
+    except HTTPException as e:
+        raise e
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Format respons AI tidak valid: {str(e)}")
     except Exception as e:
         error_traceback = traceback.format_exc()
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}\n\nTraceback:\n{error_traceback}")
