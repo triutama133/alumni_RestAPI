@@ -849,8 +849,8 @@ async def learning_path(input: LearningPathInput):
         education_summary = sanitize_ai_input("; ".join(data.get("education_summaries", [])), max_length=600)
 
         prompt = (
-            "Anda adalah mentor karir AI untuk persiapan kerja. "
-            "Buat analisis gap skill dan learning path yang spesifik, realistis, dan bisa dieksekusi.\n\n"
+            "Anda adalah mentor karir AI & Talent Scout untuk HubTalent Indonesia. "
+            "Buat analisis gap skill dan roadmap belajar sekaligus roadmap pencarian pengalaman (learning & experience path) yang spesifik, realistis, dan bisa dieksekusi.\n\n"
             f"Target role: {target_role}\n"
             f"Aktivitas pengguna saat ini: {data.get('aktivitas_primary', 'tidak diketahui')}\n"
             f"Ringkasan skill dan profil: {profile_summary}\n"
@@ -865,7 +865,9 @@ async def learning_path(input: LearningPathInput):
             "  ],\n"
             "  \"checklist\": [\"...\"]\n"
             "}\n"
-            "Aturan: hasil dalam Bahasa Indonesia, maksimal 5 item gap_analysis, 6 step learning_path, 12 checklist item."
+            "Aturan penting: Hasil dalam Bahasa Indonesia. Maksimal 5 item gap_analysis, 6 step learning_path, 12 checklist item. "
+            "Pastikan setidaknya 2 dari langkah learning_path dan 4 dari checklist item berfokus pada kegiatan praktis "
+            "seperti membuat portofolio, mengerjakan proyek riil/freelance, kontribusi open source, atau magang untuk mencari pengalaman."
         )
 
         raw_response = await call_llm_service(prompt, temperature=0.55)
