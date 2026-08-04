@@ -847,6 +847,38 @@ async def learning_path(input: LearningPathInput):
         profile_summary = sanitize_ai_input(f"{data.get('skills', '')}. {data.get('gabungan_data', '')}", max_length=1800)
         education_summary = sanitize_ai_input("; ".join(data.get("education_summaries", [])), max_length=600)
 
+        # Ambil data lowongan kerja aktif yang relevan dari pangkalan data lokal
+        jobs_context = ""
+        conn = await asyncpg.connect(SUPABASE_DB_URL, statement_cache_size=0)
+        try:
+            # Query active jobs matching target_role keyword
+            jobs_rows = await conn.fetch("""
+                SELECT job_title, company, description, job_desk, requirements, category
+                FROM jobs
+                WHERE is_active = true 
+                  AND (job_title ILIKE $1 OR description ILIKE $1 OR category ILIKE $1)
+                ORDER BY id DESC
+                LIMIT 3
+            """, f"%{target_role}%")
+            
+            if jobs_rows:
+                jobs_list = []
+                for job in jobs_rows:
+                    job_desk_str = ", ".join(job['job_desk']) if job['job_desk'] else "Tidak dispesifikasikan"
+                    reqs_str = ", ".join(job['requirements']) if job['requirements'] else "Tidak dispesifikasikan"
+                    jobs_list.append(
+                        f"- Lowongan: {job['job_title']} di {job['company']}\n"
+                        f"  Kategori: {job['category']}\n"
+                        f"  Deskripsi Singkat: {job['description'][:200]}...\n"
+                        f"  Tugas/Job Desk: {job_desk_str[:300]}\n"
+                        f"  Persyaratan Utama: {reqs_str[:300]}"
+                    )
+                jobs_context = "\n\n".join(jobs_list)
+        except Exception as e:
+            print(f"Error fetching jobs context for learning path: {e}")
+        finally:
+            await conn.close()
+
         prompt = (
             "Anda adalah mentor karir AI & Talent Scout untuk HubTalent Indonesia. "
             "Buat analisis gap skill dan roadmap belajar sekaligus roadmap pencarian pengalaman (learning & experience path) yang spesifik, realistis, dan bisa dieksekusi.\n\n"
@@ -854,6 +886,22 @@ async def learning_path(input: LearningPathInput):
             f"Aktivitas pengguna saat ini: {data.get('aktivitas_primary', 'tidak diketahui')}\n"
             f"Ringkasan skill dan profil: {profile_summary}\n"
             f"Riwayat pendidikan: {education_summary or 'Tidak ada data'}\n\n"
+        )
+
+        if jobs_context:
+            prompt += (
+                "BERIKUT ADALAH LOWONGAN KERJA NYATA YANG SEDANG AKTIF DI DATABASE HUBTALENT UNTUK PERAN INI:\n"
+                f"{jobs_context}\n\n"
+                "Instruksi Khusus: Analisis gap skill dan kurikulum harus disesuaikan secara langsung untuk melatih "
+                "keahlian yang diminta oleh lowongan nyata di atas (terutama bagian Persyaratan Utama dan Tugas/Job Desk).\n\n"
+            )
+        else:
+            prompt += (
+                "Catatan: Saat ini tidak ditemukan lowongan kerja spesifik yang aktif di database lokal kami untuk peran ini. "
+                "Oleh karena itu, buatlah rekomendasi berdasarkan standar umum industri nasional/global untuk peran target tersebut.\n\n"
+            )
+
+        prompt += (
             "Kembalikan HANYA JSON valid, tanpa teks lain, dengan skema berikut:\n"
             "{\n"
             "  \"gap_analysis\": [\n"
