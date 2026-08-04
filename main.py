@@ -38,10 +38,9 @@ async def get_api_key(api_key: str = Security(api_key_header)):
         )
     return api_key
 
-# Endpoint utama untuk verifikasi status
 @app.get("/")
 def root():
-    return {"message": "Alumni AI backend is running!"}
+    return {"message": "HubTalent AI Engine is running!"}
 
 # --- MODEL DATA (PYDANTIC) ---
 
