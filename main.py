@@ -18,9 +18,6 @@ load_dotenv()
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
 # Inisialisasi aplikasi FastAPI
@@ -131,52 +128,15 @@ async def call_gemini(prompt: str, temperature: float = 0.7) -> str:
         return res.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
-async def call_deepseek(prompt: str, temperature: float = 0.7) -> str:
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DEEPSEEK_API_KEY belum dikonfigurasi.")
-    url = "https://api.deepseek.com/chat/completions"
-    body = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": 2000,
-    }
-
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        res = await client.post(
-            url,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json=body,
-        )
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"].strip()
-
-
 async def call_llm_service(prompt: str, temperature: float = 0.7) -> str:
-    """Dispatcher LLM dengan fallback otomatis ke provider cadangan."""
-    providers = {
-        "gemini": call_gemini,
-        "deepseek": call_deepseek,
-    }
-
-    primary = LLM_PROVIDER if LLM_PROVIDER in providers else "gemini"
-    secondary = "deepseek" if primary == "gemini" else "gemini"
-
+    """Wrapper tunggal untuk memanggil Google Gemini."""
     try:
-        logging.info("[LLM] Calling primary provider: %s", primary)
-        return await providers[primary](prompt, temperature)
-    except Exception as primary_err:
-        logging.warning("[LLM] Primary provider %s failed: %s. Falling back to %s", primary, primary_err, secondary)
-        try:
-            return await providers[secondary](prompt, temperature)
-        except Exception as secondary_err:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Semua provider LLM gagal. "
-                    f"[{primary}: {primary_err}] [{secondary}: {secondary_err}]"
-                ),
-            )
+        return await call_gemini(prompt, temperature)
+    except Exception as err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Panggilan ke Gemini gagal: {err}",
+        )
 
 
 def parse_learning_path_json(raw_text: str) -> dict:
