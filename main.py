@@ -113,6 +113,39 @@ def compute_weighted_match_score(source_tokens, target_text: str, priority_keywo
             score += 1.0
     return score
 
+def build_candidate_cards(raw_candidates, *, name_key, skills_key, id_key="id", aktivitas_key="aktivitas", score_key="match_score"):
+    """
+    Turns a raw scored-candidate list (already computed for the LLM prompt) into the
+    structured shape the frontend needs for clickable, inviteable talent cards: an id
+    to link/invite by, and a 'tier' (kuat/sedang/lemah) computed relative to the top
+    score in this batch, for the orbit-style strength visualization. Previously these
+    candidates only ever reached the client as names embedded in prose.
+    """
+    if not raw_candidates:
+        return []
+
+    max_score = max((c.get(score_key) or 0) for c in raw_candidates) or 1
+    cards = []
+    for c in raw_candidates:
+        score = c.get(score_key) or 0
+        strength_pct = round((score / max_score) * 100, 1)
+        if strength_pct >= 70:
+            tier = "kuat"
+        elif strength_pct >= 40:
+            tier = "sedang"
+        else:
+            tier = "lemah"
+        cards.append({
+            "id": c.get(id_key),
+            "nama_lengkap": c.get(name_key),
+            "aktivitas": c.get(aktivitas_key),
+            "skills": c.get(skills_key) or "",
+            "match_score": score,
+            "match_strength": strength_pct,
+            "tier": tier,
+        })
+    return cards
+
 async def call_gemini(prompt: str, temperature: float = 0.7) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY belum dikonfigurasi.")
@@ -207,6 +240,7 @@ async def cari_top_alumni_kolaborasi(current_alumni_id: int, current_alumni_full
             
             if match_score > 0:
                 all_relevant_alumni.append({
+                    "id": alumni_gen["id"],
                     "nama_alumni_kolaborasi": alumni_gen["nama_lengkap"],
                     "aktivitas": alumni_gen["aktivitas"],
                     "relevance_skills": other_alumni_skills,
@@ -647,6 +681,7 @@ async def cari_alumni_untuk_proyek(project_text: str, cohort_id: int = None):
             
             if match_score > 0:
                 alumni_candidates.append({
+                    "id": alumni_gen["id"],
                     "nama_lengkap": alumni_gen["nama_lengkap"],
                     "aktivitas": alumni_gen["aktivitas"],
                     "skills_gabungan": alumni_skills,
@@ -732,7 +767,12 @@ async def rekomendasi(input: RekomendasiInput):
         prompt = build_prompt(data, input.language, source="profile")
 
         content = await call_llm_service(prompt)
-        return {"rekomendasi": content.strip()}
+        candidates = build_candidate_cards(
+            data.get("top_alumni_kolaborasi", []),
+            name_key="nama_alumni_kolaborasi",
+            skills_key="relevance_skills",
+        )
+        return {"rekomendasi": content.strip(), "candidates": candidates}
 
     except HTTPException as e:
         raise e
@@ -787,7 +827,12 @@ async def proyek_rekomendasi(input: ProyekInput):
         prompt = build_proyek_prompt(input, recommended_alumni_data, input.language)
 
         content = await call_llm_service(prompt)
-        return {"rekomendasi_proyek": content.strip()}
+        candidates = build_candidate_cards(
+            recommended_alumni_data,
+            name_key="nama_lengkap",
+            skills_key="skills_gabungan",
+        )
+        return {"rekomendasi_proyek": content.strip(), "candidates": candidates}
 
     except HTTPException as e:
         raise e
