@@ -114,6 +114,16 @@ def compute_weighted_match_score(source_tokens, target_text: str, priority_keywo
             score += 1.0
     return score
 
+# Common Indonesian/English connector words that pass the length filter in
+# tokenize_text but aren't meaningful "skills" — excluded so matched-skill badges
+# shown to users stay credible instead of surfacing words like "untuk" or "dengan".
+STOPWORDS = {
+    "untuk", "dengan", "yang", "dari", "pada", "adalah", "akan", "atau", "juga",
+    "dapat", "serta", "dalam", "oleh", "para", "tersebut", "secara", "sudah",
+    "harus", "bisa", "saja", "seperti", "maka", "lain", "lainnya", "antara",
+    "about", "with", "from", "that", "this", "have", "will", "your", "their",
+}
+
 def extract_matched_terms(source_tokens, target_text: str, limit: int = 8):
     """
     Returns the actual overlapping keywords between a source (a project's description,
@@ -125,7 +135,11 @@ def extract_matched_terms(source_tokens, target_text: str, limit: int = 8):
     if not source_tokens or not target_text:
         return []
     target_tokens = tokenize_text(target_text)
-    matched = sorted({t for t in source_tokens if t in target_tokens and len(t) >= 4}, key=len, reverse=True)
+    matched = sorted(
+        {t for t in source_tokens if t in target_tokens and len(t) >= 4 and t not in STOPWORDS},
+        key=len,
+        reverse=True,
+    )
     return matched[:limit]
 
 def build_candidate_cards(raw_candidates, *, name_key, skills_key, id_key="id", aktivitas_key="aktivitas", score_key="match_score", matched_key="matched_terms"):
