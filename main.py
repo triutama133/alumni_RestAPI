@@ -46,6 +46,7 @@ class RekomendasiInput(BaseModel):
     nama_lengkap: Optional[str] = None
     cohort_id: Optional[int] = None
     language: str = "id"
+    prompt_tambahan: Optional[str] = None
 
 class WawasanInput(BaseModel):
     user_id: Optional[int] = None
@@ -113,7 +114,21 @@ def compute_weighted_match_score(source_tokens, target_text: str, priority_keywo
             score += 1.0
     return score
 
-def build_candidate_cards(raw_candidates, *, name_key, skills_key, id_key="id", aktivitas_key="aktivitas", score_key="match_score"):
+def extract_matched_terms(source_tokens, target_text: str, limit: int = 8):
+    """
+    Returns the actual overlapping keywords between a source (a project's description,
+    or a profile's skills) and a candidate's profile text — the same token overlap
+    compute_weighted_match_score already uses to produce a number, just surfaced as
+    concrete words instead. This is what powers "matched skills" in the talent preview,
+    so it's a factual overlap, not something re-guessed by the LLM.
+    """
+    if not source_tokens or not target_text:
+        return []
+    target_tokens = tokenize_text(target_text)
+    matched = sorted({t for t in source_tokens if t in target_tokens and len(t) >= 4}, key=len, reverse=True)
+    return matched[:limit]
+
+def build_candidate_cards(raw_candidates, *, name_key, skills_key, id_key="id", aktivitas_key="aktivitas", score_key="match_score", matched_key="matched_terms"):
     """
     Turns a raw scored-candidate list (already computed for the LLM prompt) into the
     structured shape the frontend needs for clickable, inviteable talent cards: an id
@@ -140,6 +155,7 @@ def build_candidate_cards(raw_candidates, *, name_key, skills_key, id_key="id", 
             "nama_lengkap": c.get(name_key),
             "aktivitas": c.get(aktivitas_key),
             "skills": c.get(skills_key) or "",
+            "matched_skills": c.get(matched_key) or [],
             "match_score": score,
             "match_strength": strength_pct,
             "tier": tier,
@@ -237,15 +253,17 @@ async def cari_top_alumni_kolaborasi(current_alumni_id: int, current_alumni_full
             other_aktivitas_values = normalize_aktivitas_values(alumni_gen["aktivitas"])
             if set(a.lower() for a in current_aktivitas_values).intersection(a.lower() for a in other_aktivitas_values):
                 match_score += 1.5
-            
+
             if match_score > 0:
+                matched_terms = extract_matched_terms(current_alumni_tokens, other_alumni_full_profile_text)
                 all_relevant_alumni.append({
                     "id": alumni_gen["id"],
                     "nama_alumni_kolaborasi": alumni_gen["nama_lengkap"],
                     "aktivitas": alumni_gen["aktivitas"],
                     "relevance_skills": other_alumni_skills,
                     "relevance_detail_summary": other_alumni_full_profile_text,
-                    "match_score": round(match_score, 2)
+                    "match_score": round(match_score, 2),
+                    "matched_terms": matched_terms,
                 })
         
         all_relevant_alumni.sort(key=lambda x: x['match_score'], reverse=True)
@@ -476,6 +494,16 @@ def build_prompt(data, language, source="profile"):
     """
     aktivitas_list_display = ", ".join(data.get("aktivitas_list", [])) or str(data.get("aktivitas") or "tidak diketahui")
 
+    # Free-text context from the user (e.g. "Pencarian Cerdas AI" on the Hub Proyek page
+    # lets someone describe their availability/needs in natural language) — previously
+    # accepted by the Next.js route but never actually reached this prompt.
+    prompt_tambahan_content = ""
+    if data.get("prompt_tambahan"):
+        if language.lower() == "id":
+            prompt_tambahan_content = f"\n--- KONTEKS TAMBAHAN DARI PENGGUNA ---\n{data['prompt_tambahan']}\n---------------------------------------\n"
+        else:
+            prompt_tambahan_content = f"\n--- ADDITIONAL CONTEXT FROM USER ---\n{data['prompt_tambahan']}\n-------------------------------------\n"
+
     top_alumni_kolaborasi_content = ""
     if data['top_alumni_kolaborasi']:
         temp_alumni_str_list = []
@@ -618,9 +646,10 @@ def build_prompt(data, language, source="profile"):
                 f"--- PROFIL DETAIL (dari gabungan_data) ---\n{data['gabungan_data']}\n"
                 f"----------------------------------------\n\n"
                 f"{peluang_str}\n"
-                f"{top_alumni_kolaborasi_content}\n\n"
+                f"{top_alumni_kolaborasi_content}\n"
+                f"{prompt_tambahan_content}\n"
                 f"TUGAS ANDA:\n"
-                f"Berdasarkan semua informasi di atas, berikan analisis komprehensif dalam format berikut:\n"
+                f"Berdasarkan semua informasi di atas (termasuk konteks tambahan dari pengguna jika ada), berikan analisis komprehensif dalam format berikut:\n"
                 f"1. **Ringkasan Profil {data['nama_panggilan']}**: Buat ringkasan naratif yang menyoroti kekuatan utama, keahlian, dan potensi dari {data['nama_panggilan']}.\n"
                 f"2. **Analisis Peluang Kolaborasi**: Identifikasi 4-5 peluang paling relevan dari 'Konteks Peluang dari Database'. Jelaskan secara spesifik bagaimana {data['nama_panggilan']} bisa berkolaborasi atau mengisi kebutuhan tersebut. Jika relevan, sebutkan nama alumni dari 'Konteks Tambahan' yang bisa menjadi partner dalam kolaborasi ini.\n"
                 f"3. **Rekomendasi Aksi Konkret**: Berikan 4-5 rekomendasi langkah nyata yang bisa diambil {data['nama_panggilan']} untuk pengembangan karir atau proyeknya, berdasarkan profil dan peluang yang ada.\n"
@@ -635,9 +664,10 @@ def build_prompt(data, language, source="profile"):
                 f"--- DETAILED PROFILE (from gabungan_data) ---\n{data['gabungan_data']}\n"
                 f"-------------------------------------------\n\n"
                 f"{peluang_str.replace('Konteks Peluang dari Database', 'Opportunity Context from Database').replace('Peluang Bisnis', 'Business Opportunities').replace('Peluang dari Pekerja', 'Opportunities from Professionals').replace('Peluang dari Ibu Rumah Tangga', 'Opportunities from Homemakers').replace('Tidak ada data.', 'No data.')}\n"
-                f"{top_alumni_kolaborasi_content}\n\n"
+                f"{top_alumni_kolaborasi_content}\n"
+                f"{prompt_tambahan_content}\n"
                 f"YOUR TASK:\n"
-                f"Based on all the information above, provide a comprehensive analysis in the following format:\n"
+                f"Based on all the information above (including any additional user context), provide a comprehensive analysis in the following format:\n"
                 f"1. **{data['nama_panggilan']}'s Profile Summary**: Create a narrative summary highlighting {data['nama_panggilan']}'s key strengths, skills, and potential.\n"
                 f"2. **Collaboration Opportunity Analysis**: Identify the 4-5 most relevant opportunities from the 'Opportunity Context from Database'. Specifically explain how {data['nama_panggilan']} can collaborate or fill those needs. If relevant, mention names from the 'Additional Context' who could be partners in this collaboration.\n"
                 f"3. **Concrete Action Recommendations**: Provide 4-5 tangible steps {data['nama_panggilan']} can take for career or project development based on the available profile and opportunities.\n"
@@ -680,13 +710,15 @@ async def cari_alumni_untuk_proyek(project_text: str, cohort_id: int = None):
                 match_score += 1.0
             
             if match_score > 0:
+                matched_terms = extract_matched_terms(project_tokens, alumni_full_profile_text)
                 alumni_candidates.append({
                     "id": alumni_gen["id"],
                     "nama_lengkap": alumni_gen["nama_lengkap"],
                     "aktivitas": alumni_gen["aktivitas"],
                     "skills_gabungan": alumni_skills,
                     "full_profile_text": f"{alumni_skills}. {alumni_details}",
-                    "match_score": round(match_score, 2)
+                    "match_score": round(match_score, 2),
+                    "matched_terms": matched_terms,
                 })
         
         alumni_candidates.sort(key=lambda x: x['match_score'], reverse=True)
@@ -722,36 +754,22 @@ def build_proyek_prompt(proyek_input_data, recommended_alumni, language):
             f"**PROYEK YANG DIAJUKAN:**\n{proyek_info}\n"
             f"**KANDIDAT ALUMNI TERATAS (berdasarkan relevansi kata kunci):**\n{alumni_list_content}\n\n"
             f"**TUGAS ANDA:**\n"
-            f"Berdasarkan deskripsi proyek dan daftar kandidat di atas, berikan analisis berikut dengan format yang jelas:\n\n"
-            # --- PERUBAHAN DI SINI (Poin 1) ---
+            f"Daftar kandidat di atas HANYA konteks — jangan sebutkan atau daftar nama kandidat satu per satu dalam jawaban Anda, karena aplikasi sudah menampilkan setiap kandidat secara terpisah dalam bentuk visual. Berdasarkan deskripsi proyek dan gambaran umum kandidat yang tersedia, berikan HANYA dua bagian berikut:\n\n"
             f"**1. Gambaran Umum Proyek & Kebutuhan Talenta**\n"
-            f"Berikan *overview* singkat (2-3 kalimat) yang merangkum tujuan utama proyek. Setelah itu, jabarkan jenis keahlian dan peran kunci yang dibutuhkan untuk menyukseskan proyek ini (contoh: Manajer Proyek, Ahli Pemasaran Digital, Desainer Grafis, dll.).\n\n"
-            # --- PERUBAHAN DI SINI (Poin 2) ---
-            f"**2. Rekomendasi Talenta (Maksimal 10 Alumni)**\n"
-            f"Pilih **hingga 10 alumni** dari daftar kandidat yang paling ideal untuk proyek ini. Untuk setiap alumni yang direkomendasikan, sajikan dalam format daftar poin (bulleted list) yang rapi sebagai berikut:\n"
-            f"   - **Nama Alumni:** [Nama Lengkap]\n"
-            f"   - **Peran yang Direkomendasikan:** [Contoh: Project Manager, Spesialis Pemasaran, Pengembang Utama]\n"
-            f"   - **Justifikasi:** [Jelaskan dalam 1-2 kalimat mengapa keahlian dan profil detail mereka sangat cocok untuk peran tersebut dalam konteks proyek ini].\n\n"
-            f"**3. Pesan Penutup**\n"
-            f"Berikan satu paragraf penutup yang profesional untuk menyimpulkan rekomendasi."
+            f"Berikan *overview* singkat (2-3 kalimat) yang merangkum tujuan utama proyek. Setelah itu, jabarkan jenis keahlian dan peran kunci yang dibutuhkan untuk menyukseskan proyek ini (contoh: Manajer Proyek, Ahli Pemasaran Digital, Desainer Grafis, dll.), tanpa menyebut nama kandidat.\n\n"
+            f"**2. Strategi Menyusun Tim**\n"
+            f"Dalam 2-3 kalimat, berikan saran umum bagaimana sebaiknya peran-peran di atas dibagi/disusun berdasarkan pola keahlian yang terlihat di antara para kandidat (misalnya, seberapa banyak yang cenderung generalis vs spesialis), tanpa menyebut nama individu."
         ),
         "en": (
             f"You are an intelligent and strategic AI Talent Scout.\n\n"
             f"**SUBMITTED PROJECT:**\n{proyek_info}\n"
             f"**TOP ALUMNI CANDIDATES (based on keyword relevance):**\n{alumni_list_content}\n\n"
             f"**YOUR TASK:**\n"
-            f"Based on the project description and the candidate list above, provide the following analysis in a clear format:\n\n"
-            # --- CHANGED HERE (Point 1) ---
+            f"The candidate list above is context ONLY — do not name or list individual candidates in your answer, since the app already displays each one separately in a visual format. Based on the project description and the general shape of the available candidates, provide ONLY these two sections:\n\n"
             f"**1. Project Overview & Talent Needs**\n"
-            f"Provide a brief overview (2-3 sentences) summarizing the project's main goal. Afterward, list the key skills and roles needed to make this project successful (e.g., Project Manager, Digital Marketing Specialist, Graphic Designer, etc.).\n\n"
-            # --- CHANGED HERE (Point 2) ---
-            f"**2. Talent Recommendations (Up to 10 Alumni)**\n"
-            f"Select **up to 10** of the most ideal alumni from the candidate list for this project. For each recommended alumnus, present them in a neat bulleted list format as follows:\n"
-            f"   - **Alumnus Name:** [Full Name]\n"
-            f"   - **Recommended Role:** [Example: Project Manager, Marketing Specialist, Lead Developer]\n"
-            f"   - **Justification:** [Explain in 1-2 sentences why their skills and detailed profile are a perfect fit for that role in the context of this project].\n\n"
-            f"**3. Closing Message**\n"
-            f"Provide a professional closing paragraph to conclude the recommendation."
+            f"Provide a brief overview (2-3 sentences) summarizing the project's main goal. Afterward, list the key skills and roles needed to make this project successful (e.g., Project Manager, Digital Marketing Specialist, Graphic Designer, etc.), without naming candidates.\n\n"
+            f"**2. Team-Building Strategy**\n"
+            f"In 2-3 sentences, give general advice on how the roles above should be divided based on the skill patterns visible among the candidates (e.g. how many lean generalist vs. specialist), without naming individuals."
         )
     }
     return prompt_template.get(language.lower(), prompt_template["id"])
@@ -764,6 +782,7 @@ async def rekomendasi(input: RekomendasiInput):
         if input.user_id is None and not input.nama_lengkap:
             raise HTTPException(status_code=400, detail="user_id atau nama_lengkap wajib diisi")
         data = await ambil_profil_alumni(user_id=input.user_id, nama_lengkap=input.nama_lengkap, cohort_id=input.cohort_id)
+        data["prompt_tambahan"] = input.prompt_tambahan
         prompt = build_prompt(data, input.language, source="profile")
 
         content = await call_llm_service(prompt)
