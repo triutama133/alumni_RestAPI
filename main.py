@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import json
 import logging
 import os
@@ -62,6 +62,16 @@ class ProyekInput(BaseModel):
 class LearningPathInput(BaseModel):
     user_id: int
     target_role: str
+    language: str = "id"
+
+class InterviewTurn(BaseModel):
+    role: str  # "ai" atau "user"
+    content: str
+
+class InterviewSimulationInput(BaseModel):
+    user_id: int
+    target_role: str
+    conversation_history: List[InterviewTurn] = []
     language: str = "id"
 
 def sanitize_ai_input(text: str, max_length: int = 500) -> str:
@@ -221,6 +231,36 @@ def parse_learning_path_json(raw_text: str) -> dict:
         "gap_analysis": gap_analysis,
         "learning_path": learning_path,
         "checklist": checklist,
+    }
+
+
+def parse_interview_feedback_json(raw_text: str) -> dict:
+    """Ekstrak objek JSON feedback wawancara dari respons model."""
+    text = (raw_text or "").strip()
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        raise ValueError("Respons AI tidak berisi JSON valid.")
+
+    payload = json.loads(match.group(0))
+    strengths = payload.get("strengths")
+    improvements = payload.get("improvements")
+    summary = payload.get("summary")
+    overall_score = payload.get("overall_score")
+
+    if (
+        not isinstance(strengths, list)
+        or not isinstance(improvements, list)
+        or not isinstance(summary, str)
+        or not isinstance(overall_score, (int, float))
+    ):
+        raise ValueError("Struktur JSON feedback AI tidak sesuai format yang dibutuhkan.")
+
+    return {
+        "overall_score": max(1, min(10, round(overall_score))),
+        "summary": summary,
+        "strengths": strengths,
+        "improvements": improvements,
+        "closing_tip": payload.get("closing_tip") or "",
     }
 
 # --- FUNGSI LOGIKA INTI ---
@@ -1006,6 +1046,108 @@ async def learning_path(input: LearningPathInput):
         raw_response = await call_llm_service(prompt, temperature=0.55)
         parsed = parse_learning_path_json(raw_response)
         return parsed
+
+    except HTTPException as e:
+        raise e
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"Format respons AI tidak valid: {str(e)}")
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}\n\nTraceback:\n{error_traceback}")
+
+
+# --- SIMULASI WAWANCARA AI ---
+# Jumlah pertanyaan sebelum sesi ditutup dengan feedback. Sengaja dijaga singkat
+# (target ~5 menit per sesi) agar terasa sebagai latihan cepat, bukan wawancara penuh.
+INTERVIEW_QUESTION_COUNT = 5
+
+
+def build_interview_prompt(target_role: str, profile_summary: str, aktivitas: str, history: List[InterviewTurn]) -> str:
+    transcript = "\n".join(
+        f"{'Pewawancara' if turn.role == 'ai' else 'Kandidat'}: {sanitize_ai_input(turn.content, max_length=1000)}"
+        for turn in history
+    )
+    question_number = sum(1 for turn in history if turn.role == "user") + 1
+
+    prompt = (
+        "Anda adalah pewawancara HR & teknis berpengalaman yang sedang melatih kandidat untuk peran berikut "
+        f"di HubTalent Indonesia: {target_role}.\n"
+        f"Latar belakang kandidat: {aktivitas or 'tidak diketahui'}. Ringkasan profil: {profile_summary or 'Tidak ada data'}.\n\n"
+    )
+
+    if transcript:
+        prompt += f"Transkrip wawancara sejauh ini:\n{transcript}\n\n"
+        prompt += (
+            f"Ini adalah pertanyaan ke-{question_number} dari {INTERVIEW_QUESTION_COUNT}. "
+            "Berdasarkan jawaban kandidat sebelumnya, ajukan SATU pertanyaan lanjutan yang relevan — boleh menggali "
+            "lebih dalam jawaban terakhir, atau berpindah ke aspek lain (teknis, situasional, atau soft skill) agar sesi tetap variatif. "
+            "Jangan mengulang pertanyaan yang sudah ditanyakan.\n"
+        )
+    else:
+        prompt += (
+            "Ajukan SATU pertanyaan pembuka wawancara yang natural untuk peran ini — bisa perkenalan singkat, "
+            "motivasi melamar, atau pengalaman relevan.\n"
+        )
+
+    prompt += (
+        "Balas HANYA dengan teks pertanyaan itu sendiri, dalam Bahasa Indonesia, tanpa nomor, tanda kutip, "
+        "label 'Pewawancara:', atau penjelasan tambahan apapun."
+    )
+    return prompt
+
+
+def build_interview_feedback_prompt(target_role: str, profile_summary: str, history: List[InterviewTurn]) -> str:
+    transcript = "\n".join(
+        f"{'Pewawancara' if turn.role == 'ai' else 'Kandidat'}: {sanitize_ai_input(turn.content, max_length=1000)}"
+        for turn in history
+    )
+    return (
+        "Anda adalah pewawancara HR & teknis berpengalaman yang baru saja menyelesaikan sesi latihan wawancara "
+        f"untuk peran {target_role} di HubTalent Indonesia.\n"
+        f"Ringkasan profil kandidat: {profile_summary or 'Tidak ada data'}.\n\n"
+        f"Transkrip lengkap sesi:\n{transcript}\n\n"
+        "Berikan evaluasi singkat, jujur, dan membangun atas performa kandidat sepanjang sesi ini. "
+        "Kembalikan HANYA JSON valid, tanpa teks lain, dengan skema berikut:\n"
+        "{\n"
+        "  \"overall_score\": <angka 1-10>,\n"
+        "  \"summary\": \"...\",\n"
+        "  \"strengths\": [\"...\"],\n"
+        "  \"improvements\": [\"...\"],\n"
+        "  \"closing_tip\": \"...\"\n"
+        "}\n"
+        "Aturan: Hasil dalam Bahasa Indonesia. Maksimal 4 item strengths, 4 item improvements. "
+        "summary maksimal 3 kalimat. closing_tip berupa satu saran konkret untuk sesi wawancara sungguhan berikutnya."
+    )
+
+
+@app.post("/interview_simulation", dependencies=[Security(get_api_key)])
+async def interview_simulation(input: InterviewSimulationInput):
+    try:
+        target_role = sanitize_ai_input(input.target_role)
+        if not target_role:
+            raise HTTPException(status_code=400, detail="target_role wajib diisi.")
+
+        data = await ambil_profil_alumni(user_id=input.user_id)
+        profile_summary = sanitize_ai_input(f"{data.get('skills', '')}. {data.get('gabungan_data', '')}", max_length=1200)
+        aktivitas = data.get("aktivitas_primary", "")
+
+        answered_count = sum(1 for turn in input.conversation_history if turn.role == "user")
+
+        if answered_count >= INTERVIEW_QUESTION_COUNT:
+            prompt = build_interview_feedback_prompt(target_role, profile_summary, input.conversation_history)
+            raw_response = await call_llm_service(prompt, temperature=0.5)
+            feedback = parse_interview_feedback_json(raw_response)
+            return {"is_complete": True, "feedback": feedback}
+
+        prompt = build_interview_prompt(target_role, profile_summary, aktivitas, input.conversation_history)
+        raw_response = await call_llm_service(prompt, temperature=0.75)
+        question = raw_response.strip().strip('"')
+        return {
+            "is_complete": False,
+            "question": question,
+            "question_number": answered_count + 1,
+            "total_questions": INTERVIEW_QUESTION_COUNT,
+        }
 
     except HTTPException as e:
         raise e
